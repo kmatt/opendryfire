@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is the primary target; Linux runs to catch anything that
+        # accidentally depends on a macOS-only path. The suite needs no camera,
+        # microphone or cartridge, so both are meaningful.
+        os: [macos-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # opencv-python needs libGL and glib even when only importing, and
+      # sounddevice binds PortAudio at import time in dryfire.audio.
+      - name: Install native audio/video libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libglib2.0-0 libportaudio2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run pytest src/tests -q
+
+      # A plan that does not load is shipped breakage, and the CLI is the only
+      # surface most people touch. Both are cheap to check.
+      - name: Check the bundled plan and CLI entry point
+        run: |
+          uv run dryfire --help
+          uv run dryfire plan
+          uv run dryfire targets
