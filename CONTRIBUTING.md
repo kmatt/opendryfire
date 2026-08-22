@@ -82,10 +82,11 @@ wrong shape. Prefer an error the user can act on.
   portable; camera enumeration and naming in `devices.py` are macOS-specific and
   currently degrade to plain device indices elsewhere. Nobody has run this on
   either platform.
-- **Other cartridges.** Everything is tested against a Strikeman 635nm unit with
-  a ~100ms pulse. Green lasers, and short-pulse cartridges, are unexplored. If
-  you have one, `dryfire spike` output plus your `autocal` numbers is useful data
-  even if you write no code.
+- **Cartridge compatibility data.** Development used a red 635nm unit with a
+  ~100ms pulse. Other makers, green lasers, and short-pulse cartridges are
+  unexplored. If you own one, `dryfire spike` output plus your `autocal` numbers
+  is genuinely useful even if you write no code — the goal is for this to work
+  with whatever cartridge you already have.
 - **A real 60fps capture path.** OpenCV's AVFoundation backend delivers 30fps
   whatever you request, even where the hardware advertises 60. This costs
   nothing today because timing is acoustic, but more frames per pulse would

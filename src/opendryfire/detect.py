@@ -3,8 +3,8 @@
 Two problems live here, and they are different:
 
 1. *Blob detection* — is there a laser dot in this frame, and where?
-2. *Shot assembly* — a ~100ms Strikeman pulse spans 3 frames at 30fps and 6 at
-   60fps, so consecutive detections must collapse into one shot.
+2. *Shot assembly* — a ~100ms pulse spans 3 frames at 30fps and 6 at 60fps, so
+   consecutive detections must collapse into one shot.
 
 On the detection test: a <5mW 635nm dot on white paper saturates its own core to
 white, so the *peak pixel* is often not red at all — only the halo is. Testing
@@ -92,7 +92,7 @@ class DetectorConfig:
     # Shot assembly
     gap_frames: int = 2  # allowed dropped frames inside one pulse
     link_radius_px: float = 40.0  # used to pick among blobs, not to split shots
-    # Longest a single pulse may last. A Strikeman pulse is ~100ms; 350ms is
+    # Longest a single pulse may last. Common cartridges emit ~100ms; 350ms is
     # generous headroom while staying far below the time a slide rack takes,
     # so it can never merge two genuine presses.
     max_pulse_s: float = 0.35

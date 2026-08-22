@@ -9,8 +9,8 @@ pistol, and it records where each shot landed and how long the draw took. Works
 with **scaled targets** — a 1/5-scale target at 9 feet reports groups in
 15-yard-equivalent inches, so home numbers are comparable to range numbers.
 
-Built and tested against a Strikeman 635nm cartridge on macOS. Other
-firing-pin-activated cartridges should work; see [Hardware](#hardware).
+Works with any firing-pin-activated laser cartridge — no proprietary hardware,
+no subscription, no vendor app. Developed on macOS; see [Hardware](#hardware).
 
 > **Safety.** This scores dry fire; it does not make dry fire safe. All live
 > ammunition leaves the room — not the bench, the room. Verify the chamber
@@ -163,10 +163,13 @@ rewrites a line you wrote.
 
 ## Hardware
 
-**Cartridge.** Any firing-pin-activated laser cartridge. Pulse length is what
-matters: Strikeman's is ~100ms, giving 3 frames at 30fps. Cartridges with ~1ms
-pulses exist and a camera will miss most of them — a hardware limit no software
-fixes.
+**Cartridge.** Any firing-pin-activated laser cartridge, from any maker. The
+only property that matters is **pulse length**: around 100ms gives 3 frames at
+30fps, which is plenty. Some cartridges emit a ~1ms flash and a camera will miss
+most of those — a hardware limit no software fixes, so check before you buy.
+
+Red 635-650nm is what the detector is tuned for. Green would need the colour
+test in `detect.py` retargeted; that is a small change nobody has made yet.
 
 **Camera.** Anything OpenCV can open. On macOS, cameras are selected by *name*
 rather than index, because a Continuity Camera occupies an index only while the
