@@ -1,5 +1,7 @@
 # opendryfire
 
+[![tests](https://github.com/aysark/opendryfire/actions/workflows/tests.yml/badge.svg)](https://github.com/aysark/opendryfire/actions/workflows/tests.yml)
+
 Scores laser dry fire practice from a webcam, and times it from the microphone.
 
 Point a camera at a target, put a laser training cartridge in your (unloaded)
@@ -192,9 +194,10 @@ so rather than picking a threshold inside the overlap.
   buffering latency is normally disqualifying but does not matter here, since
   timing comes from audio.
 - **macOS-first.** Camera naming, Center Stage handling and device enumeration
-  are macOS-specific and degrade to plain indices elsewhere. The detection,
-  geometry, scoring and audio code is portable, but nobody has run it on Linux
-  or Windows.
+  are macOS-specific and degrade to plain device indices elsewhere. CI runs the
+  full test suite on Linux, so the portable code — detection, geometry, scoring,
+  audio — is known to work there. What has *not* happened on Linux or Windows is
+  a real session against real hardware, which is where camera quirks live.
 
 ## Development
 
