@@ -50,7 +50,7 @@ is discarded. That is what makes it usable in a room with red light in it.
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/<you>/opendryfire && cd opendryfire
+git clone https://github.com/aysark/opendryfire && cd opendryfire
 uv sync
 ```
 
@@ -227,10 +227,3 @@ commands say which.
 
 Apache-2.0, which requires attribution: the copyright notice, the licence, and
 the contents of `NOTICE` travel with the code and with any derivative work.
-
-Commercial use is permitted. That is what makes it open source rather than
-merely source-available — a licence that forbids commercial use fails the Open
-Source Definition, whatever else it may be.
-
-The licence does not grant rights to the project name or marks (Apache-2.0 §6),
-so forks are free to use the code and should pick their own name.

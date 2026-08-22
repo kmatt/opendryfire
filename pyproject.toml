@@ -20,7 +20,11 @@ classifiers = [
 dependencies = [
     "numpy>=2.5.2",
     "opencv-python>=5.0.0.93",
-    "pyobjc-framework-avfoundation>=12.2.2",
+    # macOS only. Used for camera enumeration by name and for reading/
+    # disabling Continuity Camera video effects. devices.py imports it
+    # defensively and falls back to system_profiler, then to plain device
+    # indices, so other platforms lose naming but keep working.
+    "pyobjc-framework-avfoundation>=12.2.2; sys_platform == 'darwin'",
     "reportlab>=5.0.0",
     "scipy>=1.18.0",
     "sounddevice>=0.5.6",

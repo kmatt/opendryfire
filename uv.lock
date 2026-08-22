@@ -335,7 +335,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "opencv-python" },
-    { name = "pyobjc-framework-avfoundation" },
+    { name = "pyobjc-framework-avfoundation", marker = "sys_platform == 'darwin'" },
     { name = "reportlab" },
     { name = "scipy" },
     { name = "sounddevice" },
@@ -350,7 +350,7 @@ dev = [
 requires-dist = [
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "opencv-python", specifier = ">=5.0.0.93" },
-    { name = "pyobjc-framework-avfoundation", specifier = ">=12.2.2" },
+    { name = "pyobjc-framework-avfoundation", marker = "sys_platform == 'darwin'", specifier = ">=12.2.2" },
     { name = "reportlab", specifier = ">=5.0.0" },
     { name = "scipy", specifier = ">=1.18.0" },
     { name = "sounddevice", specifier = ">=0.5.6" },
