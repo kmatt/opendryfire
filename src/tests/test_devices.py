@@ -103,3 +103,57 @@ def test_any_active_reports_each_effect():
     text = " ".join(state.warnings()).lower()
     assert "portrait" in text
     assert "studio light" in text
+
+
+# -- index order --------------------------------------------------------------
+#
+# ``devicesWithMediaType:`` orders by connection, so a Continuity Camera that
+# reconnects jumps to the front of it while OpenCV keeps the built-in camera at
+# index 0. Trusting the platform order sent `--camera iphone` to the built-in
+# webcam and labelled it "iPhone Camera" in the log (DESIGN.md 18).
+
+from opendryfire.devices import identify, opencv_order  # noqa: E402
+
+MACBOOK = VideoDevice(0, "MacBook Pro Camera", "MacBook Pro Camera", "aaa",
+                      formats=((640, 480), (1552, 1552), (1760, 1328), (1920, 1080)),
+                      builtin=True)
+IPHONE = VideoDevice(1, "iPhone Camera", "iPhone18,3", "bbb",
+                     formats=((640, 480), (1280, 720), (1920, 1080), (1920, 1440)))
+
+
+def test_a_reconnected_iphone_does_not_take_index_zero():
+    """The platform lists it first; OpenCV does not."""
+    platform_order = [
+        VideoDevice(0, IPHONE.name, IPHONE.model, IPHONE.uid, IPHONE.formats, False),
+        VideoDevice(1, MACBOOK.name, MACBOOK.model, MACBOOK.uid, MACBOOK.formats, True),
+    ]
+    ordered = opencv_order(platform_order)
+
+    assert [d.name for d in ordered] == ["MacBook Pro Camera", "iPhone Camera"]
+    assert [d.index for d in ordered] == [0, 1]
+    assert resolve("iphone", ordered) == 1
+
+
+def test_the_order_is_unchanged_when_the_platform_already_agrees():
+    ordered = opencv_order([MACBOOK, IPHONE])
+    assert [d.index for d in ordered] == [0, 1]
+    assert [d.name for d in ordered] == ["MacBook Pro Camera", "iPhone Camera"]
+
+
+def test_external_only_setups_keep_their_order():
+    a = VideoDevice(0, "Camera A", formats=((640, 480),))
+    b = VideoDevice(1, "Camera B", formats=((1280, 720),))
+    assert [d.name for d in opencv_order([a, b])] == ["Camera A", "Camera B"]
+
+
+def test_a_uniquely_offered_format_identifies_which_device_is_sending():
+    devices = [MACBOOK, IPHONE]
+    assert identify((1552, 1552), devices).name == "MacBook Pro Camera"
+    assert identify((1920, 1440), devices).name == "iPhone Camera"
+
+
+def test_a_format_both_cameras_offer_identifies_nothing():
+    """Only a unique match is evidence — this is what stops the check crying
+    wolf on a size every webcam supports."""
+    assert identify((1920, 1080), [MACBOOK, IPHONE]) is None
+    assert identify((3000, 2000), [MACBOOK, IPHONE]) is None

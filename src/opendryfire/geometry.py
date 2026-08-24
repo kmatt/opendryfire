@@ -162,6 +162,37 @@ class TargetFrame:
         return cls.from_dict(json.loads(path.read_text()))
 
 
+def frame_size_problem(
+    tf: TargetFrame, size: tuple[int, int]
+) -> str | None:
+    """Why frames of ``size`` cannot be scored through ``tf``, or None.
+
+    A calibration maps *these* pixels to inches, so it is valid only for the
+    frame geometry it was built in. The camera does not reliably deliver the
+    format it was asked for and its own property read-back does not reveal that
+    (see ``camera.Camera._configure``), so the check has to be made against
+    real frames, here, before anything is scored.
+
+    The two formats are not the same view at two sizes. Measured on the
+    reference hardware, the 16:9 stream is the 4:3 one scaled 0.9 with ~120
+    rows cut from the top and bottom; scoring 16:9 pixels through a 4:3
+    calibration moved the A-zone centre by 0.90", on a zone 1.18" wide. That is
+    a whole-zone error which looks like an ordinary high-left group, which is
+    why this refuses instead of warning.
+    """
+    have, want = tuple(size), tuple(tf.image_size)
+    if 0 in have or 0 in want or have == want:
+        return None
+    return (
+        f"this calibration was built on {want[0]}x{want[1]} frames but the "
+        f"camera is delivering {have[0]}x{have[1]}. Those are different views, "
+        f"not one view at two sizes, so every hit would be scored through the "
+        f"wrong geometry.\n"
+        f"  Fix the format (`dryfire probe` shows what each camera grants), or "
+        f"recalibrate at this size with `dryfire calibrate`."
+    )
+
+
 def build_homography(
     image_points: list[tuple[float, float]],
     target_points: list[tuple[float, float]],

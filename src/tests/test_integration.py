@@ -12,7 +12,11 @@ import numpy as np
 import pytest
 
 from opendryfire.detect import DetectorConfig, LaserDetector
-from opendryfire.geometry import azone_reference_points, calibrate_from_points
+from opendryfire.geometry import (
+    azone_reference_points,
+    calibrate_from_points,
+    frame_size_problem,
+)
 from opendryfire.session import pair_events
 from opendryfire.plans import load_plan
 from opendryfire.targets import group_stats
@@ -196,3 +200,62 @@ def test_mask_margin_scales_with_the_target():
     # of frame because the fake camera normalises the target to the same pixels.
     assert 0.05 < (third > 0).mean() < 0.35
     assert 0.05 < (fifth > 0).mean() < 0.35
+
+
+# -- camera format ------------------------------------------------------------
+#
+# The camera does not reliably deliver the format it was asked for, and its own
+# property read-back echoes the request rather than the truth (test_camera). So
+# a session can open in 16:9 against a calibration built in 4:3. This is the
+# round trip that says what that costs, because nothing about the output looks
+# wrong when it happens — it reads as an ordinary high group.
+
+
+def project_4_3(target, pts, pose="oblique"):
+    """The fake camera above, at the 1920x1440 format the plan asks for."""
+    return [(x * 1.5, y * 1.5) for x, y in target_to_pixels(target, pts, pose)]
+
+
+def as_16_9(px, py):
+    """Where a 4:3 pixel appears in the 16:9 stream of the same scene.
+
+    Measured on the reference hardware by aligning frames captured back to back
+    in both formats (normalized cross-correlation 0.998): the 16:9 stream is
+    the 4:3 view scaled 0.9, cutting ~120 rows off the top and the bottom and
+    showing ~107px more on each side. DESIGN.md 16.
+    """
+    return 0.9 * px + 96, 0.9 * py - 108
+
+
+@pytest.mark.parametrize("pose", ["frontal", "oblique"])
+def test_a_16_9_stream_scored_through_a_4_3_calibration_lands_elsewhere(pose):
+    target = PLAN_SETUPS["f-15"]
+    tf = calibrate_from_points(
+        project_4_3(target, azone_reference_points(target), pose),
+        target, (1920, 1440),
+    )
+    azone_half_width = target.spec.zone(target.spec.primary_zone).w * target.scale / 2
+
+    for probe in [(0.0, 0.0), (0.3, 0.6), (-0.4, -0.7)]:
+        (px, py), = project_4_3(target, [probe], pose)
+        scored = tf.to_target(*as_16_9(px, py))
+        moved = float(np.hypot(scored[0] - probe[0], scored[1] - probe[1]))
+        assert moved > azone_half_width, (
+            f"{probe} moved only {moved:.2f}\" — if the formats were this close "
+            f"the guard would not be worth its weight"
+        )
+
+    # And it is not merely a number that shifts: a centred A-zone hit is
+    # reported as a different zone entirely.
+    (px, py), = project_4_3(target, [(0.0, 0.0)], pose)
+    assert target.score(0.0, 0.0)[0] == "A"
+    assert target.score(*tf.to_target(*as_16_9(px, py)))[0] != "A"
+
+
+def test_the_guard_refuses_exactly_that_stream():
+    target = PLAN_SETUPS["f-15"]
+    tf = calibrate_from_points(
+        project_4_3(target, azone_reference_points(target)), target, (1920, 1440)
+    )
+    assert frame_size_problem(tf, (1920, 1440)) is None
+    assert frame_size_problem(tf, (1920, 1080)) is not None

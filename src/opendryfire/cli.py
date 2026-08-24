@@ -34,11 +34,19 @@ from .audio import (
 from .camera import Camera, enumerate_cameras
 from .detect import (
     DetectorConfig,
+    DotMeasurement,
     LaserDetector,
     calibrate_scene,
     describe_calibration,
+    measure_dot,
 )
-from .devices import CameraNotFound, list_devices, preflight, resolve
+from .devices import (
+    CameraMismatch,
+    CameraNotFound,
+    list_devices,
+    preflight,
+    resolve,
+)
 from .drills import ParLadder, coaching_note, evaluate_rep
 from .feedback import Chimes
 from .feedback import describe as describe_chimes
@@ -47,6 +55,7 @@ from .geometry import (
     TargetFrame,
     calibrate_from_points,
     drift_score,
+    frame_size_problem,
     make_marker_sheet,
     signature,
 )
@@ -57,6 +66,43 @@ from .ui import click_calibration, draw_overlay, scoreboard
 from .vault import VaultPaths, append_to_tracker, session_note
 
 ROOT = Path.home() / ".dryfire"
+
+
+def _load_dot_measurement() -> DotMeasurement | None:
+    """The measured laser, if `spike` has ever measured one in this room."""
+    path = ROOT / "dot.json"
+    if not path.exists():
+        return None
+    try:
+        return DotMeasurement.from_dict(json.loads(path.read_text()))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _save_dot_measurement(dot: DotMeasurement) -> Path:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    path = ROOT / "dot.json"
+    path.write_text(json.dumps(dot.to_dict(), indent=2))
+    return path
+
+
+def _oversized_warning(frames: int, largest: int, cfg) -> list[str]:  # noqa: ANN001
+    """What to say when the detector threw away a red region for being too big.
+
+    This is the failure that has no symptom of its own: the splash is
+    discarded, some fragment of its edge is scored in its place, and the number
+    that comes out looks like an ordinary shot in an ordinary group.
+    """
+    if not frames:
+        return []
+    return [
+        f"{frames} frames held a red region bigger than max_area "
+        f"({cfg.max_area}px) — largest {largest}px.",
+        "That region is the laser, over-exposed. It was NOT scored; anything "
+        "scored at the same moment was a fragment of its edge, not the dot.",
+        "Run `dryfire spike` to measure the dot, then `dryfire autocal` to size "
+        "the ceiling to it.",
+    ]
 
 
 def _load_detector_config() -> DetectorConfig:
@@ -101,15 +147,68 @@ def _open_camera(args, quiet: bool = False) -> Camera:  # noqa: ANN001
     spec = _camera_spec(args)
     try:
         cam = Camera(spec, args.width, args.height, args.fps)
-    except CameraNotFound as exc:
+    except (CameraNotFound, CameraMismatch) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         raise SystemExit(1) from exc
     if not quiet:
         print(f"camera: {cam.name} (index {cam.index}) "
               f"{cam.info.width}x{cam.info.height}")
+        for msg in _format_warnings(cam, args):
+            print(f"  ! {msg}")
         for msg in preflight(cam.index):
             print(f"  ! {msg}")
     return cam
+
+
+def _format_warnings(cam: Camera, args) -> list[str]:  # noqa: ANN001
+    """What to say when the stream is not the format that was requested.
+
+    The size printed above is measured from a delivered frame, so it can differ
+    from both the request and the driver's own read-back. Both differences
+    matter: the first changes the field of view a calibration is built in, and
+    the second means nothing else the driver reports can be taken at face
+    value.
+    """
+    out: list[str] = []
+    if not cam.info.verified:
+        out.append(
+            "no frame arrived while opening the camera, so its size is the "
+            "driver's claim and not a measurement"
+        )
+        return out
+    if cam.info.frame_size != (args.width, args.height):
+        out.append(
+            f"asked for {args.width}x{args.height}; this device is sending "
+            f"{cam.info.width}x{cam.info.height}"
+        )
+    if cam.info.size_is_a_lie():
+        out.append(
+            f"the driver reports {cam.info.claimed[0]}x{cam.info.claimed[1]} "
+            f"while sending {cam.info.width}x{cam.info.height} — it is "
+            f"echoing the request, not the format it configured"
+        )
+    return out
+
+
+def _geometry_ok(size: tuple[int, int], tf: TargetFrame, *, fatal: bool) -> bool:
+    """Check a live stream against the geometry its calibration was built in.
+
+    Fatal wherever a hit becomes a number — a mismatch there corrupts the log
+    silently. A warning in ``spike``, which scores nothing and is a diagnostic
+    someone may legitimately run in any format.
+    """
+    if 0 in tuple(tf.image_size):
+        print("  ! this calibration records no frame size, so the camera "
+              "geometry cannot be verified. Recalibrate to record one.")
+        return True
+    problem = frame_size_problem(tf, size)
+    if problem is None:
+        return True
+    if fatal:
+        print(f"\n{problem}\n", file=sys.stderr)
+        return False
+    print(f"  ! {problem}")
+    return True
 
 
 # -- probe --------------------------------------------------------------------
@@ -195,6 +294,13 @@ def cmd_use_camera(args) -> int:  # noqa: ANN001
 # -- spike --------------------------------------------------------------------
 
 
+def _crop_around(frame: np.ndarray, x: float, y: float, half: int = 60):
+    """A square crop centred on a detection, clamped to the frame."""
+    h, w = frame.shape[:2]
+    cx, cy = int(x), int(y)
+    return frame[max(0, cy - half): cy + half, max(0, cx - half): cx + half]
+
+
 def cmd_spike(args) -> int:  # noqa: ANN001
     """Answer the only question that gates the whole project: in this room,
     with this camera, does a trigger press produce a detectable flash?"""
@@ -211,14 +317,29 @@ def cmd_spike(args) -> int:  # noqa: ANN001
     print("geometry yet, so a shot on the wall sounds the same as one on the A-zone.")
     print("Saving a crop of every detection so false positives are visible.\n")
 
+    pending: np.ndarray | None = None
     with _open_camera(args) as cam:
+        # A spike scores nothing, so a format change cannot corrupt a number
+        # here — but it silently changes the view, and the preview looking
+        # unlike the calibration window is exactly the symptom that sent
+        # someone looking. Say it out loud instead.
+        cal = calibration_path(ROOT, getattr(args, "profile", "default"))
+        if cal.exists():
+            _geometry_ok(cam.info.frame_size, TargetFrame.load(cal), fatal=False)
         t_end = time.perf_counter() + args.seconds
         while time.perf_counter() < t_end:
             r = cam.read()
             if r is None:
                 continue
             frame, t = r
+            was_open = det.open_shot is not None
             shot = det.push(frame, t)
+            # Grab the crop on the frame where the pulse *opens*. By the time
+            # push hands back a Shot the dot has been dark for several frames,
+            # so cropping then saves a picture of the target with no laser on
+            # it — which is exactly the evidence the crop exists to provide.
+            if not was_open and det.open_shot is not None:
+                pending = _crop_around(frame, det.open_shot.x, det.open_shot.y)
             if shot is not None:
                 # A spike runs before calibration, so there is no target
                 # geometry and nothing here knows a hit from a miss. Play the
@@ -227,9 +348,11 @@ def cmd_spike(args) -> int:  # noqa: ANN001
                 chimes.play("seen")
                 shots.append(shot)
                 n = len(shots)
-                x, y = int(shot.x), int(shot.y)
-                crop = frame[max(0, y - 60): y + 60, max(0, x - 60): x + 60]
-                if crop.size:
+                crop = pending if pending is not None else _crop_around(
+                    frame, shot.x, shot.y
+                )
+                pending = None
+                if crop is not None and crop.size:
                     cv2.imwrite(str(out / f"hit_{n:02d}.jpg"), crop)
                 print(f"  {n:2d}. ({shot.x:7.1f},{shot.y:7.1f})  "
                       f"{shot.frames} frames  {shot.duration * 1000:5.1f}ms  "
@@ -250,13 +373,36 @@ def cmd_spike(args) -> int:  # noqa: ANN001
 
     print(f"\n{len(shots)} detections for {args.expect} presses.")
     print(f"Crops in {out} — check every one is a real hit before trusting the count.")
+
+    # The measurement this whole command exists to be able to take: how big the
+    # laser's footprint actually is in this room, at this distance, on this
+    # surface. Everything that judges a blob by size was guessing until now.
+    dot = measure_dot(det, shots, measured=date.today().isoformat())
+    for line in _oversized_warning(det.oversized_frames,
+                                   max((o.area for o in det.oversized), default=0),
+                                   cfg):
+        print(f"  ! {line}")
+    print("\nLaser measurement")
+    for line in dot.lines():
+        if line:
+            print(f"  {line}")
+    if dot.areas:
+        rejected = dot.rejected_by(cfg.max_area)
+        print(f"  rejected by the current max_area ({cfg.max_area}px): "
+              f"{rejected} of {dot.flashes}")
+        path = _save_dot_measurement(dot)
+        print(f"  saved to {path} — `dryfire autocal` sizes the ceiling from it")
+        if dot.flashes != args.expect:
+            print(f"  note: {dot.flashes} flashes measured for {args.expect} "
+                  f"presses; the measurement is only as good as that match")
+
     if len(shots) == args.expect:
-        print("Clean. Detection is not the bottleneck; go to `dryfire calibrate`.")
+        print("\nClean. Detection is not the bottleneck; go to `dryfire calibrate`.")
     elif len(shots) < args.expect:
-        print("Under-detecting. Dim the room, or move the camera closer to the target.")
+        print("\nUnder-detecting. Dim the room, or move the camera closer to the target.")
         print("Then lower --margin/--threshold via `dryfire autocal`.")
     else:
-        print("Over-detecting. Run `dryfire autocal` to raise thresholds "
+        print("\nOver-detecting. Run `dryfire autocal` to raise thresholds "
               "against this room.")
     return 0
 
@@ -280,15 +426,32 @@ def cmd_autocal(args) -> int:  # noqa: ANN001
     cal = calibration_path(ROOT, args.profile)
     if cal.exists() and not args.no_mask:
         tf = TargetFrame.load(cal)
+        # The mask is drawn in the calibration's pixel space. In a different
+        # format it lands somewhere else in the scene, and thresholds derived
+        # through it describe the wrong patch of room.
+        h, w = frames[0].shape[:2]
+        if not _geometry_ok((w, h), tf, fatal=True):
+            return 1
         mask = tf.scoring_mask(frames[0].shape)
         print("Restricting calibration to the calibrated target plane.")
 
-    cfg, report = calibrate_scene(frames, mask)
+    dot = _load_dot_measurement()
+    if dot is None:
+        print("No laser measurement found; the size ceiling will be an "
+              "assumption. `dryfire spike` measures it.")
+    else:
+        print(f"Using the laser measured on {dot.measured or 'an earlier run'}: "
+              f"{dot.flashes} flashes, largest {dot.largest}px.")
+
+    cfg, report = calibrate_scene(frames, mask, dot=dot)
     print(f"  brightest red pixel : {report['brightest_red_pixel']}")
     print(f"  max ambient redness : {report['max_ambient_redness']}")
     print(f"  chosen threshold    : {report['chosen_threshold']}")
     print(f"  chosen margin       : {report['chosen_margin']}"
           + (f"  (capped from {report['wanted_margin']})" if report["capped"] else ""))
+    print(f"  chosen max area     : {report['chosen_max_area']}"
+          + (f"  (dot {report['dot_area']}px, room {report['room_red_area']}px)"
+             if report["dot_measured"] else "  (assumed — no dot measured)"))
     print(f"  false blobs after   : {report['false_blobs_after']}")
     print(f"  masked to target    : {report['masked']}")
 
@@ -412,6 +575,13 @@ def cmd_run(args) -> int:  # noqa: ANN001
     rc = _run_timed(args, block, target, tf, session, ladder) if timed else \
         _run_untimed(args, block, target, tf, session)
 
+    if rc != 0:
+        # The only way out with a non-zero code is a run that never started —
+        # the camera geometry did not match the calibration. Saving the empty
+        # session anyway would put a rep-less entry in the training log and
+        # export it to the vault, which is a made-up record of a session that
+        # did not happen.
+        return rc
     _finish(session, target, args)
     return rc
 
@@ -425,8 +595,13 @@ def _run_timed(args, block, target, tf, session, ladder) -> int:  # noqa: ANN001
     # settle wait below.
     chimes = Chimes(volume=args.volume, enabled=not args.no_sound)
     mask = None
+    # Each rep gets a fresh detector, so the count of rejected-for-size regions
+    # has to be carried across them.
+    oversized_frames, oversized_largest = 0, 0
 
     with _open_camera(args) as cam:
+        if not _geometry_ok(cam.info.frame_size, tf, fatal=True):
+            return 1
         for i in range(args.reps):
             par = ladder.par if ladder else block.start_par
             print(f"\nrep {i + 1}/{args.reps}  par {par:.2f}s  "
@@ -493,11 +668,18 @@ def _run_timed(args, block, target, tf, session, ladder) -> int:  # noqa: ANN001
                 sound = "advance"
             chimes.play(sound)
 
+            oversized_frames += det.oversized_frames
+            oversized_largest = max(
+                oversized_largest, max((o.area for o in det.oversized), default=0)
+            )
+
             # Let the chime finish before the next rep opens its recording,
             # or the tail would be heard as that rep's striker click and the
             # draw time would come out near zero.
             _sleep(chimes.duration(sound) + 0.15)
     chimes.stop()
+    for line in _oversized_warning(oversized_frames, oversized_largest, cfg):
+        print(f"  ! {line}")
     return 0
 
 
@@ -532,6 +714,8 @@ def _run_untimed(args, block, target, tf, session) -> int:  # noqa: ANN001
         print()
     try:
         with _open_camera(args) as cam:
+            if not _geometry_ok(cam.info.frame_size, tf, fatal=True):
+                return 1
             while len(shots) < args.reps:
                 r = cam.read()
                 if r is None:
@@ -580,6 +764,10 @@ def _run_untimed(args, block, target, tf, session) -> int:  # noqa: ANN001
         chimes.stop()
         listener.stop()
         cv2.destroyAllWindows()
+    for line in _oversized_warning(
+        det.oversized_frames, max((o.area for o in det.oversized), default=0), cfg
+    ):
+        print(f"  ! {line}")
     return 0
 
 

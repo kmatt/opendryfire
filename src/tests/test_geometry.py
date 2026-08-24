@@ -17,6 +17,7 @@ from opendryfire.geometry import (
     build_homography,
     calibrate_from_points,
     drift_score,
+    frame_size_problem,
     signature,
 )
 from opendryfire.plans import load_plan
@@ -186,3 +187,41 @@ def test_scoring_mask_covers_the_target_and_excludes_the_room():
     assert mask[int(cy), int(cx)] == 255  # target centre is inside
     assert mask[10, 10] == 0  # far corner of the room is not
     assert mask.mean() < 200  # most of the frame is excluded
+
+
+# -- frame geometry -----------------------------------------------------------
+#
+# A calibration is only valid for the frame geometry it was built in, and the
+# camera does not reliably deliver the format it was asked for — see
+# ``test_camera``. These are the tests that stop that becoming a scored number.
+
+
+def calibration_at(size):
+    target = PLAN_SETUPS["f-15"]
+    corners_px = project(target, azone_reference_points(target), "oblique")
+    return calibrate_from_points(corners_px, target, size)
+
+
+def test_the_format_it_was_built_in_is_accepted():
+    tf = calibration_at((1920, 1440))
+    assert frame_size_problem(tf, (1920, 1440)) is None
+
+
+def test_a_different_format_is_refused_and_names_both_sizes():
+    tf = calibration_at((1920, 1440))
+    problem = frame_size_problem(tf, (1920, 1080))
+    assert problem is not None
+    assert "1920x1440" in problem and "1920x1080" in problem
+    assert "recalibrate" in problem.lower()
+
+
+def test_a_calibration_with_no_recorded_size_cannot_be_checked():
+    """Silence here is not an all-clear, so the caller says so — the point is
+    that this must not masquerade as a passed check."""
+    tf = calibration_at((0, 0))
+    assert frame_size_problem(tf, (1920, 1440)) is None
+
+
+def test_an_unmeasured_stream_cannot_be_checked_either():
+    tf = calibration_at((1920, 1440))
+    assert frame_size_problem(tf, (0, 0)) is None

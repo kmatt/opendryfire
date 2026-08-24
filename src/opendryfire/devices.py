@@ -7,14 +7,23 @@ built-in webcam between one session and the next — and since the calibration i
 saved per profile, a swapped camera scores every shot through a homography
 built for a different lens.
 
-So cameras are addressed by name. AVFoundation's ``devicesWithMediaType:`` is
-the same list, in the same order, that OpenCV's AVFoundation backend indexes
-into — verified against both on this machine — so a name maps to an index
-exactly.
+So cameras are addressed by name. Mapping a name to the index OpenCV will use
+is the whole problem, and the obvious answer is wrong: ``devicesWithMediaType:``
+does **not** return devices in OpenCV's order. It was observed returning
+``[MacBook, iPhone]`` one hour and ``[iPhone, MacBook]`` the next — it follows
+connection order — while OpenCV's AVFoundation backend kept the built-in camera
+at index 0 both times. Trusting that order sent ``--camera iphone`` to the
+built-in webcam, named it "iPhone Camera" in the log, and scored every shot
+through the wrong lens (DESIGN.md 18).
+
+So the list is re-ordered the way OpenCV enumerates — built-in cameras first,
+then the rest — and, because that is still an inference about someone else's
+internals, ``camera.Camera`` verifies the identity of what it opened against
+the formats the named device advertises, and refuses when they disprove it.
 
 Three fallbacks, in order:
-  1. pyobjc AVFoundation (authoritative: real names, and effect state)
-  2. ``system_profiler SPCameraDataType`` (names, order observed to match)
+  1. pyobjc AVFoundation (authoritative: real names, formats, and effect state)
+  2. ``system_profiler SPCameraDataType`` (names only, no formats to verify)
   3. bare indices (no names; a plain integer still works)
 """
 
@@ -50,12 +59,20 @@ class VideoDevice:
     name: str
     model: str = ""
     uid: str = ""
+    # Frame sizes the device advertises. Carried so that what a capture
+    # actually delivers can be checked against the device it is supposed to be
+    # — the only evidence available that the index mapping was right.
+    formats: tuple[tuple[int, int], ...] = ()
+    builtin: bool = False
 
     @property
     def is_continuity(self) -> bool:
         """True for an iPhone/iPad acting as a webcam, which can vanish."""
         n = self.name.lower()
         return "iphone" in n or "ipad" in n
+
+    def supports(self, size: tuple[int, int]) -> bool:
+        return tuple(size) in self.formats
 
     def __str__(self) -> str:
         tag = "  (Continuity — may disconnect)" if self.is_continuity else ""
@@ -78,15 +95,49 @@ def list_devices() -> list[VideoDevice]:
 
 
 def _list_avfoundation() -> list[VideoDevice]:  # pragma: no cover - needs hardware
-    devices = _AV.AVCaptureDevice.devicesWithMediaType_(_AV.AVMediaTypeVideo)
+    import CoreMedia as _CM
+
+    devices = []
+    for d in _AV.AVCaptureDevice.devicesWithMediaType_(_AV.AVMediaTypeVideo):
+        sizes = set()
+        try:
+            for f in d.formats():
+                dm = _CM.CMVideoFormatDescriptionGetDimensions(f.formatDescription())
+                sizes.add((int(dm.width), int(dm.height)))
+        except Exception:  # pragma: no cover - defensive
+            pass
+        devices.append(
+            VideoDevice(
+                index=0,  # assigned by opencv_order below
+                name=str(d.localizedName()),
+                model=str(d.modelID()),
+                uid=str(d.uniqueID()),
+                formats=tuple(sorted(sizes)),
+                builtin=str(d.deviceType()) == "AVCaptureDeviceTypeBuiltInWideAngleCamera",
+            )
+        )
+    return opencv_order(devices)
+
+
+def opencv_order(devices: list[VideoDevice]) -> list[VideoDevice]:
+    """Re-index a device list the way OpenCV's AVFoundation backend does.
+
+    Built-in cameras first, then everything else in the order the platform gave
+    them. ``devicesWithMediaType:`` orders by connection instead, so a
+    Continuity Camera that reconnects moves to the front of *that* list while
+    OpenCV keeps the built-in webcam at index 0.
+    """
+    ordered = sorted(range(len(devices)), key=lambda i: (not devices[i].builtin, i))
     return [
         VideoDevice(
-            index=i,
-            name=str(d.localizedName()),
-            model=str(d.modelID()),
-            uid=str(d.uniqueID()),
+            index=new_index,
+            name=devices[old].name,
+            model=devices[old].model,
+            uid=devices[old].uid,
+            formats=devices[old].formats,
+            builtin=devices[old].builtin,
         )
-        for i, d in enumerate(devices)
+        for new_index, old in enumerate(ordered)
     ]
 
 
@@ -96,19 +147,36 @@ def _list_system_profiler() -> list[VideoDevice]:  # pragma: no cover - needs ha
         capture_output=True, text=True, timeout=15,
     ).stdout
     items = json.loads(raw).get("SPCameraDataType", [])
-    return [
+    return opencv_order([
         VideoDevice(
             index=i,
             name=str(it.get("_name", f"camera {i}")),
             model=str(it.get("spcamera_model-id", "")),
             uid=str(it.get("spcamera_unique-id", "")),
+            builtin="facetime" in str(it.get("_name", "")).lower()
+            or "macbook" in str(it.get("_name", "")).lower(),
         )
         for i, it in enumerate(items)
-    ]
+    ])
 
 
 class CameraNotFound(RuntimeError):
     """Raised when a named camera is not currently connected."""
+
+
+class CameraMismatch(RuntimeError):
+    """Raised when the device that opened is provably not the one named."""
+
+
+def identify(size: tuple[int, int], devices: list[VideoDevice]) -> VideoDevice | None:
+    """The one device that advertises ``size``, if exactly one does.
+
+    Used to check an opened capture against the name it was resolved from. Only
+    a unique match is evidence — two cameras that both offer 1280x720 say
+    nothing about which one is sending it.
+    """
+    matches = [d for d in devices if d.supports(size)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def resolve(spec: str | int, devices: list[VideoDevice] | None = None) -> int:
