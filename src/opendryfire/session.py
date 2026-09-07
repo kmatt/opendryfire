@@ -132,11 +132,23 @@ class Session:
         return group_stats([(s.x, s.y) for s in self.all_shots], target)
 
     def summary(self) -> str:
+        """Reported over *valid* reps, with discards named separately.
+
+        Counting a discarded rep as a dirty one reads as "you missed the bar"
+        when what happened is "the rep was never measured" — and it disagrees
+        with the ladder, which only ever judged the valid ones. Both numbers
+        matter, so both are stated.
+        """
         t = self.times()
-        parts = [f"{self.block} | {len(self.reps)} reps"]
+        valid = self.valid_reps
+        parts = [f"{self.block} | {len(valid)} reps"]
         if t:
             parts.append(f"best {min(t):.2f}s, avg {sum(t) / len(t):.2f}s")
-        parts.append(f"{self.clean_count}/{len(self.reps)} clean")
+        clean = f"{self.clean_count}/{len(valid)} clean"
+        discarded = len(self.reps) - len(valid)
+        if discarded:
+            clean += f" ({discarded} discarded)"
+        parts.append(clean)
         return " | ".join(parts)
 
     # -- persistence ----------------------------------------------------------

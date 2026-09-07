@@ -495,6 +495,52 @@ correctness rests on is measuring the result and refusing to score through the
 wrong one. This is §6 again: the read-back existed, looked like verification,
 and could not fail.
 
+## 16a. Refusing to score through the wrong format is not enough
+
+Reported as a calibration that would not take: `run` refused with
+
+```
+this calibration was built on 1920x1080 frames but the camera is delivering
+1920x1440 ...
+```
+
+on a profile that had been calibrated the same evening. The shooter's reading
+was that the calibration was stale. It was the opposite — it was the *newest*
+file on disk, and it was wrong.
+
+`~/.dryfire/calibration/b-draw.json` had been written twice: once at 21:59
+recording `image_size [1920, 1440]`, and again at 23:05 recording
+`[1920, 1080]`. The 23:05 run is one of the ~1-in-8 opens from §16 that lands
+in the device's default format. `_format_warnings` did say so —
+
+```
+  ! asked for 1920x1440; this device is sending 1920x1080
+```
+
+— and then `cmd_calibrate` opened the click window and saved anyway, over the
+good file.
+
+§16 made the wrong format impossible to *score* through. It left it possible to
+*record*. Those are not the same hole, and the second one is worse in a
+specific way: the artefact it produces is indistinguishable from a good one
+after the fact. The corners really were clicked in that view, so the
+reprojection error is perfect; the `image_size` field is honest about a format
+nobody chose; and every later command sees a valid calibration disagreeing with
+a live stream and reports the *stream* as the problem. The one moment the
+evidence exists is while the camera is still open, and that is the moment the
+old code spent on a warning line among several.
+
+`calibration_format_problem` refuses there instead, *before* the corners are
+clicked — placing four points is a minute of the shooter's time and all of it
+is void. Asking for the delivered size explicitly (`--width 1920 --height
+1080`) is allowed and is the escape hatch, on the same principle as a bare
+`--camera 1` in §18: a format someone named is a choice, a format that arrived
+on its own is an accident.
+
+The general shape, and it is §6 and §18 again: a check that fires everywhere
+the bad value is *read* still leaves the bad value being *written*, and a
+persisted artefact outlives the context that would have explained it.
+
 ## 17. `max_area` was a guess wearing a measurement's clothes
 
 Symptom: hits drawn several inches from where the laser visibly landed, a 2.6"
@@ -599,3 +645,150 @@ Two changes, because one of them is still an inference:
 The general lesson is the one from §6, applied to somebody else's ordering
 guarantee: an assumption that can be checked cheaply against physical evidence
 should be, because the day it stops holding it will not announce itself.
+
+## 19. The camera has to be watched while the rep happens
+
+Reported as "it doesn't work": every rep of `dryfire run B` printed
+
+```
+  ready...   click heard but no laser seen — off-target, or the cartridge did not fire
+```
+
+on shots that were on target. The microphone heard the striker every time, so
+audio, pairing, and the cartridge were all fine. What was missing was the
+camera, and the reason was structural rather than a threshold.
+
+`_run_timed` was shaped like this:
+
+```python
+while time.perf_counter() < stop:      # 1.2s of reads before the beep
+    ...
+rep_result = timer.run_rep(listen_seconds=args.listen)   # BLOCKS ~6s
+t_cam_end = time.perf_counter() + 0.35                   # 0.35s of reads after
+```
+
+`run_rep` opens the full-duplex stream, plays the beep and sleeps until the
+recording is full. It is the whole rep. Nothing calls `cam.read()` for its
+entire duration — so the camera was read for 1.2s *before* the beep and 0.35s
+*after* the listen window closed, and never during the 6.3s in between. The
+draw lands at beep + 1.5-2.5s, squarely inside the blind window. The only shot
+this arrangement could ever see was one fired before the buzzer or six seconds
+late.
+
+The tempting reply is that the frames must still be queued somewhere. They are
+not. Measured on the reference Continuity Camera, opening the stream, idling
+6.0s with no reads, then draining as fast as possible for 0.35s:
+
+```
+frames recovered in the 0.35s drain: 11
+per-read ms: 34 33 32 33 36 30 37 34 32 32 35
+```
+
+Eleven frames, each taking a full frame period to arrive. AVFoundation
+discards late frames rather than queueing them, so the ~180 frames that elapsed
+during the gap are gone, and the drain is simply a live read of the room *after*
+the laser went out. No drain length could have recovered them; and even a FIFO
+deep enough to hold six seconds could not have been consumed in 0.35s.
+
+The fix is to run the audio rep on its own thread and keep reading the camera
+on the main one, which is what `_run_untimed` already did with `LiveListener`.
+Timing is untouched: it still comes from the single full-duplex stream inside
+`run_rep`, and the camera still only ever answers *where*. Measured on the same
+hardware, with a real `ShotTimer` rep running:
+
+```
+frames read during the 2.0s rep: 71  (29.8/s)
+beep heard: True
+```
+
+The camera's full native rate, for the whole rep, with the beep still detected —
+so hammering `cap.read()` on the main thread does not starve the CoreAudio
+callback of the GIL. Detection costs 4.1ms per 1920x1440 frame including the
+scoring mask, a 245fps ceiling, so the reads are not the limit either.
+
+Two smaller things follow:
+
+- The message was a lie of omission, and an expensive one: it named two causes
+  ("off-target, or the cartridge did not fire") that are both the shooter's
+  fault, when the actual cause was that nothing was looking. It now reports how
+  many frames were examined and at what rate, so a blind loop can never again
+  present itself as a miss.
+- This shipped because nothing tested the run loop at all. `test_integration`
+  covers pixels->inches->score, and every stage passed while the system as a
+  whole could not see. `test_run_loop.py` drives `_run_timed` with a fake
+  camera and a fake timer and asserts the camera is read *during* the listen
+  window — the one fact no unit test was in a position to notice.
+
+## 20. A discarded rep is a missing measurement, not a failed one
+
+Reported twice in one evening as "did I advance?" — with the answer both times
+being no, on blocks that looked like they should have:
+
+```
+B | 10 reps | best 0.89s, avg 2.17s | 8/10 clean
+  9/9 in the A-zone (100%).
+```
+
+`clean_to_advance = 8` of `of_reps = 10`, and the summary says 8 of 10. It
+still did not drop. Replaying the ladder against the saved session shows why:
+
+```
+  4    -    -     False  False   3/3     <- discarded, no beep
+...
+ladder saw 9 reps (window needs 10); final par 2.50s; drops: none
+```
+
+`ParLadder.record` returns False unless the window is full, and only *valid*
+reps are recorded — a rep with no beep has no start time, so there is nothing
+to judge and it is correctly not judged. But the block ran `for i in
+range(args.reps)`, so a discarded rep consumed one of the ten. The window
+could then never fill, and **a single discard made the block unable to advance
+at all, whatever was shot in it.**
+
+The rate is not negligible. Across every session on disk:
+
+```
+total reps 103, discarded for no beep 10  =  10%
+```
+
+all ten of them in timed blocks — 10 of 60, **17%**. (The untimed F-blocks
+never play a beep, so they cannot contribute; the comparison is void, not
+reassuring.) At 17%, a ten-rep block reaches the end with a full window about
+16% of the time. The block was, in practice, almost never winnable.
+
+The conflation is the bug. "Not clean" and "not measured" are different facts
+and the loop treated them as one. So the block now runs until it has the valid
+reps it asked for, re-running a discard rather than spending the slot on it.
+
+Two bounds, because "run until valid" must not become unbounded on a dead
+microphone: `MAX_ATTEMPT_FACTOR = 2` caps total attempts, and
+`MAX_CONSECUTIVE_DISCARDS = 3` stops early. Both are deliberately loose — at
+17%, ten valid reps need about twelve attempts and three straight discards is a
+0.5% event, so either bound firing means something is broken rather than
+unlucky, and both say so. A block that ends short announces itself, because the
+consequence is otherwise *silence*: the ladder declines to evaluate a window it
+never got, and an abstention is indistinguishable from shooting that was not
+good enough. That is the whole failure being fixed, so it cannot be allowed to
+recur one level up.
+
+`Session.summary` was part of the same conflation. `8/10 clean` counted the
+discard as a dirty rep, reading as "you missed the bar" when the rep was never
+measured — and disagreeing with the ladder, which had judged nine. It now
+reports over valid reps and names discards separately:
+
+```
+B | 10 reps | best 1.31s, avg 1.31s | 10/10 clean (2 discarded)
+```
+
+`ParLadder` itself is unchanged. Refusing to evaluate a short window is right;
+it just needed the block to hand it a full one.
+
+What this does **not** fix is the discard rate. Stream priming was eliminated
+as the cause — input onset measured 42.7ms on all 20 opens, dead stable, so
+the beep is always well inside the recording. The recorded beep level, though,
+swings by a factor of 37 between runs (0.060, 0.011, 0.0016 RMS) and once
+collapsed 37x mid-run at rep 8 and stayed down. `find_beep_onset` survives
+because its prominence test is a ratio rather than a level, but it is running
+with nothing like the margin that was there when its thresholds were set. That
+is a lead, not a root cause, and 32 instrumented reps failed to reproduce an
+actual miss.

@@ -118,10 +118,30 @@ flow, sound, or fusion usually has to change in both.
   needs the pixels of the break (a crop, an overlay, a snapshot) must act when
   `LaserDetector.open_shot` becomes non-None. `spike` cropping the closing
   frame is how it saved eight blank crops and made a real bug unfalsifiable.
+- **A discarded rep is re-run, not counted.** No beep means the rep was never
+  measured, so `_run_timed` loops until it has `args.reps` *valid* reps rather
+  than `range(args.reps)`. `ParLadder` only records reps it can judge, so
+  spending a slot on a discard left its window permanently short and the block
+  could not advance however well it was shot (DESIGN.md §20). The two bounds
+  (`MAX_ATTEMPT_FACTOR`, `MAX_CONSECUTIVE_DISCARDS`) are what keep a dead mic
+  from making that unbounded.
+- **The camera must be read *during* the rep, not around it.** `ShotTimer.run_rep`
+  blocks for the whole listen window, so in `_run_timed` it runs on a worker
+  thread while the main loop keeps calling `cam.read()`. Nothing is buffered:
+  idle the stream for 6s and a 0.35s drain returns 11 live frames, not the ~180
+  that elapsed (DESIGN.md §19). Inlining that call back onto the capture thread
+  makes every rep report "click heard but no laser seen" on a centre hit.
 - **Chime fundamentals stay ≤ `feedback.MAX_SAFE_FREQ` (700 Hz) with a 12 ms
   raised-cosine attack.** A sharp ping *is* a striker click acoustically.
   `test_chime_is_not_heard_as_a_click` pins this; don't raise the ceiling
   without re-running it.
+- **A calibration may only be built in a format the driver actually granted.**
+  `cmd_calibrate` refuses on a mismatch *before* the corners are clicked
+  (`calibration_format_problem`). A calibration saved in the wrong view is
+  indistinguishable from a good one afterwards — perfect reprojection, honest
+  `image_size`, and every later command blames the live stream instead
+  (DESIGN.md §16a). Asking for the delivered size explicitly is the escape
+  hatch.
 - **Cameras are addressed by name, not index.** A Continuity Camera enters and
   leaves the index list, so a saved index silently scores through the wrong
   lens' homography.

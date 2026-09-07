@@ -88,12 +88,14 @@ transition figure is repeatable but is not a true live-fire split."""
 key = "F15"
 name = "Distance Refinement — 15 yd equivalent"
 setup = "f-15"
-timed = false
+timed = true
+start_par = 2.5
+target_par = 0.8
 reps = 10
 minutes = 5
 guidance = """
-10 presentations from compressed ready. Break the shot only when the front \
-sight is genuinely still."""
+From concealment. The sight picture is the gate, not the beep — never chase a \
+par your sights cannot support."""
 warning = """
 Untimed by design: at distance the clock hides the error you came to find. \
 Add a par only after a month of untimed work, and only at the 15 yd mark."""

@@ -193,6 +193,42 @@ def frame_size_problem(
     )
 
 
+def calibration_format_problem(
+    requested: tuple[int, int], delivered: tuple[int, int]
+) -> str | None:
+    """Why a calibration must not be *built* on ``delivered``, or None.
+
+    §16 stopped the wrong format being scored through; it did not stop one
+    being written down. A calibrate run that silently lands in the device's
+    default format saves a valid-looking `TargetFrame` whose ``image_size`` is
+    a view the shooter never asked for, and the reprojection error is perfect
+    because the corners really were clicked in it. The evidence that anything
+    is wrong exists only at that moment — every later command sees a good file
+    and a stream that disagrees with it, and blames the stream.
+
+    So the refusal belongs here, before the corners are clicked: a format the
+    driver did not grant is not a format to record geometry in. Asking for the
+    delivered size explicitly is the escape hatch, exactly as a bare
+    ``--camera 1`` is for the name-to-index check.
+    """
+    want, have = tuple(requested), tuple(delivered)
+    if 0 in want or 0 in have or want == have:
+        return None
+    return (
+        f"refusing to calibrate on a {have[0]}x{have[1]} stream: "
+        f"{want[0]}x{want[1]} was asked for and the camera granted something "
+        f"else. Those are different views, not one view at two sizes, so a "
+        f"calibration built here would record geometry for a format you did "
+        f"not choose — and every later run would either be refused for not "
+        f"matching it, or scored through it.\n"
+        f"  Format negotiation loses this on roughly one open in eight "
+        f"(DESIGN.md 16), so simply running `dryfire calibrate` again usually "
+        f"takes it.\n"
+        f"  If {have[0]}x{have[1]} is the format you actually want, ask for it:"
+        f"  --width {have[0]} --height {have[1]}"
+    )
+
+
 def build_homography(
     image_points: list[tuple[float, float]],
     target_points: list[tuple[float, float]],

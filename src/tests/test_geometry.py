@@ -17,6 +17,7 @@ from opendryfire.geometry import (
     build_homography,
     calibrate_from_points,
     drift_score,
+    calibration_format_problem,
     frame_size_problem,
     signature,
 )
@@ -225,3 +226,34 @@ def test_a_calibration_with_no_recorded_size_cannot_be_checked():
 def test_an_unmeasured_stream_cannot_be_checked_either():
     tf = calibration_at((1920, 1440))
     assert frame_size_problem(tf, (0, 0)) is None
+
+
+# -- calibrating in a format the driver did not grant --------------------------
+
+
+def test_calibrating_on_a_format_that_was_not_granted_is_refused():
+    """The gap §16 left open. Scoring through the wrong format was already
+    refused; *recording* geometry in one was not, and a calibration saved that
+    way looks perfect afterwards — the evidence exists only while the camera is
+    open."""
+    problem = calibration_format_problem((1920, 1440), (1920, 1080))
+    assert problem is not None
+    assert "1920x1440" in problem and "1920x1080" in problem
+    # It has to say how to proceed, both ways: retry, or ask for what you got.
+    assert "again" in problem
+    assert "--width 1920 --height 1080" in problem
+
+
+def test_the_format_that_was_asked_for_calibrates_without_complaint():
+    assert calibration_format_problem((1920, 1440), (1920, 1440)) is None
+
+
+def test_asking_for_the_delivered_format_is_the_escape_hatch():
+    """Naming the size you are actually getting is a choice, not an accident,
+    and must be allowed — as a bare ``--camera 1`` is for the index check."""
+    assert calibration_format_problem((1920, 1080), (1920, 1080)) is None
+
+
+def test_an_unmeasured_size_cannot_be_judged_either_way():
+    assert calibration_format_problem((1920, 1440), (0, 0)) is None
+    assert calibration_format_problem((0, 0), (1920, 1080)) is None

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -54,6 +55,7 @@ from .geometry import (
     DRIFT_THRESHOLD,
     TargetFrame,
     calibrate_from_points,
+    calibration_format_problem,
     drift_score,
     frame_size_problem,
     make_marker_sheet,
@@ -103,6 +105,32 @@ def _oversized_warning(frames: int, largest: int, cfg) -> list[str]:  # noqa: AN
         "Run `dryfire spike` to measure the dot, then `dryfire autocal` to size "
         "the ceiling to it.",
     ]
+
+
+def _short_block_warning(
+    session, args, attempts: int, valid_done: int  # noqa: ANN001
+) -> list[str]:
+    """What to say about reps that had to be re-run, or never happened.
+
+    A block that came up short must say so, because the visible consequence is
+    silence: the ladder simply declines to evaluate a window it never got, and
+    an abstention looks exactly like a block that was not good enough.
+    """
+    discarded = attempts - valid_done
+    out: list[str] = []
+    if valid_done < args.reps:
+        out.append(
+            f"block is SHORT: {valid_done} valid reps of {args.reps} asked for, "
+            f"in {attempts} attempts. The ladder needs a full window, so it "
+            f"will abstain — this block cannot advance the par whatever was "
+            f"shot in it."
+        )
+    elif discarded:
+        out.append(
+            f"{discarded} rep{'s' if discarded > 1 else ''} discarded for no "
+            f"beep and re-run; {attempts} attempts for {valid_done} valid reps."
+        )
+    return out
 
 
 def _load_detector_config() -> DetectorConfig:
@@ -491,6 +519,16 @@ def cmd_calibrate(args) -> int:  # noqa: ANN001
             print("no frame from camera", file=sys.stderr)
             return 1
 
+    # Check before the clicking, not after: the format is the one fact that
+    # invalidates every corner about to be placed, and a saved calibration
+    # carries no trace of having been built in the wrong one.
+    problem = calibration_format_problem(
+        (args.width, args.height), (frame.shape[1], frame.shape[0])
+    )
+    if problem is not None:
+        print(f"\n{problem}\n", file=sys.stderr)
+        return 1
+
     pts = click_calibration(frame, target)
     if pts is None:
         print("cancelled")
@@ -586,6 +624,27 @@ def cmd_run(args) -> int:  # noqa: ANN001
     return rc
 
 
+# A discarded rep is a *missing measurement*, not a failed one — no beep means
+# the rep was never observed, so there is nothing to judge. Counting it toward
+# the block is what made a 10-rep block unwinnable on a single discard: the
+# ladder only records reps it can judge, so its window never filled and it
+# abstained no matter how well the block was shot. So the block runs until it
+# has the valid reps it asked for.
+#
+# Both bounds below exist so that a dead microphone cannot turn "run until
+# valid" into an unbounded session. They are deliberately loose: at the ~17%
+# discard rate measured on the reference setup, ten valid reps need about
+# twelve attempts, and three consecutive discards is a 0.5% event — so either
+# bound firing means something is broken, not unlucky, and it says so.
+MAX_ATTEMPT_FACTOR = 2
+MAX_CONSECUTIVE_DISCARDS = 3
+
+# Camera time either side of the timed rep: enough to settle the detector
+# before the beep, and to close a pulse still lit when the window ends.
+WARMUP_S = 1.2
+TAIL_S = 0.35
+
+
 def _run_timed(args, block, target, tf, session, ladder) -> int:  # noqa: ANN001
     """Beep, listen, look. One rep at a time."""
     timer = ShotTimer(config=_load_onset_config())
@@ -602,37 +661,92 @@ def _run_timed(args, block, target, tf, session, ladder) -> int:  # noqa: ANN001
     with _open_camera(args) as cam:
         if not _geometry_ok(cam.info.frame_size, tf, fatal=True):
             return 1
-        for i in range(args.reps):
+        valid_done = attempts = consecutive = 0
+        max_attempts = args.reps * MAX_ATTEMPT_FACTOR
+        while valid_done < args.reps and attempts < max_attempts:
+            attempts += 1
             par = ladder.par if ladder else block.start_par
-            print(f"\nrep {i + 1}/{args.reps}  par {par:.2f}s  "
+            # The rep number counts what has been *measured*; the attempt
+            # number only appears once the two have diverged, so a clean block
+            # reads exactly as it did before.
+            label = f"rep {valid_done + 1}/{args.reps}"
+            if attempts != valid_done + 1:
+                label += f" (attempt {attempts})"
+            print(f"\n{label}  par {par:.2f}s  "
                   f"{ladder.status() if ladder else ''}")
             print("  ready... ", end="", flush=True)
 
             det = LaserDetector(cfg)
             flashes: list = []
-            stop = time.perf_counter() + 1.2
-            while time.perf_counter() < stop:
-                r = cam.read()
-                if r:
-                    if mask is None:
-                        mask = tf.scoring_mask(r[0].shape)
-                    det.push(cv2.bitwise_and(r[0], r[0], mask=mask), r[1])
+            frames_seen = 0
+            t_rep0 = time.perf_counter()
 
-            rep_result = timer.run_rep(listen_seconds=args.listen)
-            t_cam_end = time.perf_counter() + 0.35
-            while time.perf_counter() < t_cam_end:
+            def look() -> None:
+                """Read one frame and push it through the detector."""
+                nonlocal mask, frames_seen
                 r = cam.read()
                 if r is None:
-                    continue
+                    return
+                if mask is None:
+                    mask = tf.scoring_mask(r[0].shape)
+                frames_seen += 1
                 s = det.push(cv2.bitwise_and(r[0], r[0], mask=mask), r[1])
                 if s is not None:
                     flashes.append(s)
+
+            # Warm the stream and settle the detector before the beep.
+            stop = time.perf_counter() + WARMUP_S
+            while time.perf_counter() < stop:
+                look()
+            # Anything lit before the beep is a false start, not this rep's shot.
+            flashes.clear()
+
+            # The rep has to be *watched while it happens*. ``run_rep`` blocks
+            # for the whole listen window and the draw lands inside it, so it
+            # runs on its own thread while the camera keeps reading here.
+            # Reading only after it returns looks at the room seconds after the
+            # laser went out, and nothing is buffered: a 6s gap then a 0.35s
+            # drain gives back 11 live frames, not the ~180 that elapsed. Every
+            # frame of the pulse is simply gone, and the run reports "click
+            # heard but no laser seen" on a shot that was dead centre.
+            #
+            # Timing is untouched by this: it still comes from the one
+            # full-duplex stream inside ``run_rep``. The camera only ever
+            # answers *where*.
+            done: list = []
+
+            def listen_rep() -> None:
+                try:
+                    done.append(timer.run_rep(listen_seconds=args.listen))
+                except Exception as exc:  # reported below, never swallowed
+                    done.append(exc)
+
+            worker = threading.Thread(target=listen_rep, daemon=True)
+            worker.start()
+            while worker.is_alive():
+                look()
+            worker.join()
+
+            # Drain the tail so a pulse still lit at the buzzer closes here.
+            t_cam_end = time.perf_counter() + TAIL_S
+            while time.perf_counter() < t_cam_end:
+                look()
             s = det.flush()
             if s is not None:
                 flashes.append(s)
 
-            rep = Rep(index=i, par=par, valid=rep_result.valid)
-            if not rep_result.valid:
+            rep_result = done[0] if done else None
+            if isinstance(rep_result, Exception):
+                # A dead audio device is not a missed beep. Say which it was,
+                # and keep the reps already recorded.
+                print(f"  AUDIO FAILED — {rep_result} — rep discarded")
+                rep_result = None
+
+            rep = Rep(index=attempts - 1, par=par,
+                      valid=bool(rep_result and rep_result.valid))
+            if rep_result is None:
+                pass  # already reported
+            elif not rep_result.valid:
                 print("  NO BEEP HEARD — rep discarded (check mic/speaker volume)")
             else:
                 rep.first_shot_time = rep_result.first_shot_time
@@ -645,8 +759,16 @@ def _run_timed(args, block, target, tf, session, ladder) -> int:  # noqa: ANN001
                                    drift_px=fl.drift, frames=fl.frames)
                     )
                 if not flashes:
+                    # How many frames were examined belongs in this message.
+                    # Without it, a camera that was not being read at all is
+                    # indistinguishable from a shot that missed the target —
+                    # and the run blames the shooter for both.
+                    elapsed = time.perf_counter() - t_rep0
+                    rate = frames_seen / max(elapsed, 1e-9)
                     print("  click heard but no laser seen — off-target, or "
                           "the cartridge did not fire")
+                    print(f"       ({frames_seen} frames examined, "
+                          f"{rate:.0f}/s)")
 
             ok, why = evaluate_rep(rep, par)
             session.reps.append(rep)
@@ -677,6 +799,23 @@ def _run_timed(args, block, target, tf, session, ladder) -> int:  # noqa: ANN001
             # or the tail would be heard as that rep's striker click and the
             # draw time would come out near zero.
             _sleep(chimes.duration(sound) + 0.15)
+
+            if rep.valid:
+                valid_done += 1
+                consecutive = 0
+                continue
+            consecutive += 1
+            if consecutive >= MAX_CONSECUTIVE_DISCARDS:
+                print(f"\n  {consecutive} reps discarded in a row — stopping.\n"
+                      f"  The microphone is not hearing the beep. Check the "
+                      f"input and output devices in `dryfire probe`, and the "
+                      f"system volume, then re-run `dryfire audiocal`.")
+                break
+            print(f"  re-running rep {valid_done + 1} — a discarded rep is a "
+                  f"missing measurement, not a failed one")
+
+    for line in _short_block_warning(session, args, attempts, valid_done):
+        print(f"  ! {line}")
     chimes.stop()
     for line in _oversized_warning(oversized_frames, oversized_largest, cfg):
         print(f"  ! {line}")
@@ -810,9 +949,10 @@ def cmd_report(args) -> int:  # noqa: ANN001
         target = plan.setups.get(s.setup_key)
         stats = s.stats(target) if target else None
         best = s.best_time()
-        print(f"{s.started:<20} {s.block:<6} {len(s.reps):>5} "
+        n = len(s.valid_reps)
+        print(f"{s.started:<20} {s.block:<6} {n:>5} "
               f"{(f'{best:.2f}s' if best else '—'):>7} "
-              f"{f'{s.clean_count}/{len(s.reps)}':>7} "
+              f"{f'{s.clean_count}/{n}':>7} "
               f"{(f'{stats.sim_extreme_spread:.2f}\"' if stats and stats.n else '—'):>11}")
     return 0
 
